@@ -1,0 +1,541 @@
+//@version=6
+indicator("ALPHA - H4 Fib / H1 Entry / M15 View", shorttitle="ALPHA MTF", overlay=true, dynamic_requests=true, max_lines_count=100, max_labels_count=150, max_boxes_count=3, max_bars_back=1500)
+
+// =====================================================
+// SETTINGS
+// =====================================================
+float forceATR = input.float(1.0, "H4 wave movement / ATR", minval=0.1, step=0.1, group="1. Wave")
+int anchorBars = input.int(10, "Prior H4 bars used to locate A", minval=2, maxval=100, group="1. Wave")
+
+float tolerance4 = input.float(0.25, "H4 EMA34 touch tolerance / H4 ATR", minval=0, step=0.05, group="1. Wave")
+float tolerance1 = input.float(0.15, "H1 EMA89 touch tolerance / H1 ATR", minval=0, step=0.05, group="1. Wave")
+
+float slATR = input.float(0.2, "SL buffer beyond A / H1 ATR", minval=0, step=0.05, group="1. Wave")
+float tpTolerance = input.float(0.0, "1.618 zone tolerance / H4 ATR (0 = exact)", minval=0, maxval=0.25, step=0.01, group="1. Wave")
+
+bool showEMA = input.bool(true, "Show chart EMA34 red / EMA89 blue", group="2. Display")
+bool showWave = input.bool(true, "Show W1 / W2 labels", group="2. Display")
+bool showZone = input.bool(true, "Show waiting zone on H4", group="2. Display")
+bool fibOnLower = input.bool(false, "Also show H4 Fib on H1 / M15", group="2. Display")
+bool history = input.bool(true, "Keep last 5 completed plans", group="2. Display")
+
+bool jsonAlerts = input.bool(true, "Enable JSON alerts", group="3. Alerts")
+
+// =====================================================
+// CLOSED H4 DATA
+// =====================================================
+f_h4data() =>
+    float e = ta.ema(close, 34)
+    float av = ta.atr(14)
+
+    float priorLo = ta.lowest(low, anchorBars)[1]
+    float priorHi = ta.highest(high, anchorBars)[1]
+
+    int loOffset = int(nz(math.abs(ta.lowestbars(low, anchorBars)[1]), 0)) + 1
+    int hiOffset = int(nz(math.abs(ta.highestbars(high, anchorBars)[1]), 0)) + 1
+
+    int loTime = time[loOffset]
+    int hiTime = time[hiOffset]
+
+    bool up = close > e and close[1] <= e[1]
+    bool dn = close < e and close[1] >= e[1]
+
+    bool gapUp = low > high[2]
+    bool gapDn = high < low[2]
+
+    bool warm = bar_index >= math.max(40, anchorBars + 2) and av > 0
+
+    [time[1], time_close[1], high[1], low[1], close[1], close[2], e[1], av[1], priorLo[1], priorHi[1], up[1], dn[1], gapUp[1], gapDn[1], warm[1], loTime[1], hiTime[1]]
+
+// =====================================================
+// SHARED H1 ENGINE
+// No drawings or alerts inside this requested engine.
+// =====================================================
+f_h1engine() =>
+    [hTime, hCloseTime, hHigh, hLow, hClose, hPrevClose, hEMA, hATR, hPriorLo, hPriorHi, hCrossUp, hCrossDn, hGapUp, hGapDn, hReady, hPriorLoTime, hPriorHiTime] = request.security(syminfo.tickerid, "240", f_h4data(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+
+    float ema89 = ta.ema(close, 89)
+    float atr1 = ta.atr(14)
+
+    var int lastH4 = na
+    bool newH4 = hReady and (na(lastH4) or hCloseTime != lastH4)
+
+    // 0 waiting; 1 W1 forming; 2 W2; 3 invalid.
+    var int waveState = 0
+    var int direction = 0
+    var int waveKey = na
+    var int pullTime = na
+
+    var float a = na
+    var float b = na
+    var float c = na
+    var float extreme = na
+    var float startClose = na
+    var float seedATR = na
+
+    var int aTime = na
+    var int bTime = na
+    var int cTime = na
+    var int extremeTime = na
+
+    var bool gapFound = false
+    var bool strong = false
+
+    var int seenKey = na
+    var int blockedKey = na
+    var int consumedKey = na
+
+    var bool touch34 = false
+    var bool touch89 = false
+
+    // Frozen cycle.
+    var bool cycleLocked = false
+    var bool slTouched = false
+    var bool wave3Confirmed = false
+
+    var int planBar = na
+    var int planKey = na
+    var int planDir = 0
+
+    var float entry = na
+    var float stopPrice = na
+    var float target = na
+    var float planA = na
+    var float planB = na
+    var float planC = na
+
+    var int planATime = na
+    var int planBTime = na
+    var int planCTime = na
+
+    var float targetBand = na
+    var string status = "CHO W1"
+    var string outcome = "N/A"
+
+    bool buy = false
+    bool sell = false
+    bool invalid = false
+    bool confirmed = false
+    bool cycleCompleted = false
+    bool tpExit = false
+    bool slExit = false
+    bool releasedThisBar = false
+
+    // TP or SL ends the cycle.
+    if cycleLocked and bar_index > planBar
+        bool stopHit = planDir == 1 ? low <= stopPrice : high >= stopPrice
+        bool targetHit = planDir == 1 ? high >= target - targetBand : low <= target + targetBand
+
+        if not stopHit and not wave3Confirmed and (planDir == 1 ? close > planB : close < planB)
+            wave3Confirmed := true
+            confirmed := true
+            outcome := "W3 XAC NHAN - CHO TP / SL"
+
+        // If both levels are touched, assume SL first.
+        if stopHit or targetHit
+            slTouched := stopHit
+            slExit := stopHit
+            tpExit := not stopHit and targetHit
+            invalid := stopHit
+
+            cycleLocked := false
+            cycleCompleted := true
+            releasedThisBar := true
+            outcome := stopHit ? "CHAM SL / HET CHU KY" : "CHAM 1.618 / HET CHU KY"
+
+            waveState := 0
+            direction := 0
+            waveKey := na
+            a := na
+            b := na
+            c := na
+            extreme := na
+            gapFound := false
+            strong := false
+            seenKey := na
+            touch34 := false
+            touch89 := false
+
+    // Process each completed H4 once.
+    if newH4
+        lastH4 := hCloseTime
+
+        if not cycleLocked and not releasedThisBar
+            if waveState == 3
+                waveState := 0
+
+            if waveState == 1
+                gapFound := gapFound or (direction == 1 ? hGapUp : hGapDn)
+
+                bool pull = direction == 1 ? hHigh < extreme and hClose < hPrevClose : hLow > extreme and hClose > hPrevClose
+
+                strong := direction * (extreme - startClose) >= forceATR * seedATR
+
+                if pull
+                    if strong and gapFound
+                        b := extreme
+                        bTime := extremeTime
+                        c := direction == 1 ? hLow : hHigh
+                        cTime := hTime
+                        pullTime := hTime
+                        waveState := 2
+                    else
+                        waveState := 3
+                else
+                    if (direction == 1 ? hHigh > extreme : hLow < extreme)
+                        extremeTime := hTime
+
+                    extreme := direction == 1 ? math.max(extreme, hHigh) : math.min(extreme, hLow)
+                    strong := direction * (extreme - startClose) >= forceATR * seedATR
+
+                if (direction == 1 ? hLow <= a : hHigh >= a)
+                    waveState := 3
+
+            else if waveState == 2
+                if (direction == 1 ? hLow < c : hHigh > c)
+                    cTime := hTime
+
+                c := direction == 1 ? math.min(c, hLow) : math.max(c, hHigh)
+
+                if (direction == 1 ? hLow <= a or hHigh >= b : hHigh >= a or hLow <= b)
+                    waveState := 3
+
+            if (waveState == 0 or waveState == 3) and (hCrossUp or hCrossDn)
+                waveState := 1
+                direction := hCrossUp ? 1 : -1
+                waveKey := hCloseTime
+
+                a := direction == 1 ? math.min(hPriorLo, hLow) : math.max(hPriorHi, hHigh)
+                aTime := direction == 1 ? (hLow < hPriorLo ? hTime : hPriorLoTime) : (hHigh > hPriorHi ? hTime : hPriorHiTime)
+
+                b := na
+                c := na
+                extreme := direction == 1 ? hHigh : hLow
+                extremeTime := hTime
+                startClose := hPrevClose
+                seedATR := hATR
+
+                gapFound := direction == 1 ? hGapUp : hGapDn
+                strong := direction * (extreme - startClose) >= forceATR * seedATR
+                pullTime := na
+
+    // H1 confirmation.
+    if not cycleLocked and not releasedThisBar
+        if not na(waveKey) and (na(seenKey) or seenKey != waveKey)
+            seenKey := waveKey
+            touch34 := false
+            touch89 := false
+
+        status := not hReady ? "DANG TAI DU LIEU" : waveState == 1 ? (not gapFound ? "W1: CHO GAP" : not strong ? "W1: CHO DU LUC" : "W1: CHO NHIP HOI") : waveState == 3 ? "WAVE KHONG HOP LE" : "CHO W1 MOI"
+
+        bool allowed = waveState == 2 and (na(blockedKey) or blockedKey != waveKey) and (na(consumedKey) or consumedKey != waveKey)
+
+        if allowed
+            for j = 1 to 4
+                if time[j] >= pullTime
+                    touch34 := touch34 or low[j] <= hEMA + tolerance4 * hATR and high[j] >= hEMA - tolerance4 * hATR
+                    touch89 := touch89 or low[j] <= ema89[j] + tolerance1 * atr1[j] and high[j] >= ema89[j] - tolerance1 * atr1[j]
+
+            touch34 := touch34 or low <= hEMA + tolerance4 * hATR and high >= hEMA - tolerance4 * hATR
+            touch89 := touch89 or low <= ema89 + tolerance1 * atr1 and high >= ema89 - tolerance1 * atr1
+
+            bool broken = direction == 1 ? low <= a or high >= b : high >= a or low <= b
+
+            bool turns = direction == 1 ? close > open and close > close[1] and close > ema89 : close < open and close < close[1] and close < ema89
+
+            status := not touch34 ? "CHO EMA34 H4" : not touch89 ? "CHO EMA89 H1" : "CHO H1 QUAY DAU"
+
+            if broken
+                blockedKey := waveKey
+                invalid := true
+                status := "A/B DA BI PHA"
+
+            else if touch34 and touch89 and turns
+                // H4 Fibonacci Extension, frozen at entry.
+                float tp = math.round_to_mintick(c + (b - a) * 1.618)
+                float sl = math.round_to_mintick(a - direction * math.max(slATR * atr1, syminfo.mintick))
+                float band = tpTolerance * hATR
+
+                if tp > 0 and sl > 0 and direction * (tp - close) > band and direction * (close - sl) > 0
+                    planA := a
+                    planB := b
+                    planC := c
+                    planATime := aTime
+                    planBTime := bTime
+                    planCTime := cTime
+
+                    entry := close
+                    stopPrice := sl
+                    target := tp
+                    targetBand := band
+
+                    planDir := direction
+                    planKey := waveKey
+                    planBar := bar_index
+
+                    cycleLocked := true
+                    slTouched := false
+                    wave3Confirmed := false
+                    consumedKey := waveKey
+
+                    buy := direction == 1
+                    sell := direction == -1
+                    outcome := "CHU KY H4 DANG CHAY"
+
+    if cycleLocked
+        status := "DANG CHU KY: CHO TP / SL"
+    else if releasedThisBar
+        status := "HET CHU KY - TIM W1 MOI"
+
+    int ev = buy ? 1 : sell ? -1 : slExit ? -2 : tpExit ? 2 : invalid ? 4 : confirmed ? 3 : 0
+    int eventKey = buy or sell or cycleCompleted or cycleLocked ? planKey : waveKey
+
+    [time_close, high, low, ev, cycleLocked, entry, stopPrice, target, planA, planB, planC, planDir, eventKey, planATime, planBTime, planCTime, status, outcome, waveState, hEMA, hATR]
+
+// =====================================================
+// MULTI-TIMEFRAME DELIVERY
+// H4 reads ALL available H1 intrabars.
+// =====================================================
+f_batches() =>
+    if timeframe.isminutes and timeframe.multiplier == 240
+        [atc, ahi, alo, aev, alk, ape, aps, apt, apa, apb, apc, apd, apk, aat, abt, act, ast, aoc, aws, ahe, ahat] = request.security_lower_tf(syminfo.tickerid, "60", f_h1engine())
+        [atc, ahi, alo, aev, alk, ape, aps, apt, apa, apb, apc, apd, apk, aat, abt, act, ast, aoc, aws, ahe, ahat]
+    else
+        [stc, shi, slo, sev, slk, spe, sps, spt, spa, spb, spc, spd, spk, sat, sbt, sct, sst, soc, sws, she, shat] = request.security(syminfo.tickerid, "60", f_h1engine(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+        [array.from(stc), array.from(shi), array.from(slo), array.from(sev), array.from(slk), array.from(spe), array.from(sps), array.from(spt), array.from(spa), array.from(spb), array.from(spc), array.from(spd), array.from(spk), array.from(sat), array.from(sbt), array.from(sct), array.from(sst), array.from(soc), array.from(sws), array.from(she), array.from(shat)]
+
+[atc, ahi, alo, aev, alk, ape, aps, apt, apa, apb, apc, apd, apk, aat, abt, act, ast, aoc, aws, ahe, ahat] = f_batches()
+
+// =====================================================
+// CHART EMA — ALL TIMEFRAMES
+// =====================================================
+float chartEMA34 = ta.ema(close, 34)
+float chartEMA89 = ta.ema(close, 89)
+
+plot(showEMA ? chartEMA34 : na, "EMA 34", color=color.red, linewidth=2)
+plot(showEMA ? chartEMA89 : na, "EMA 89", color=color.blue, linewidth=2)
+
+bool onH4 = timeframe.isminutes and timeframe.multiplier == 240
+bool onH1 = timeframe.isminutes and timeframe.multiplier == 60
+bool onM15 = timeframe.isminutes and timeframe.multiplier == 15
+
+bool supported = chart.is_standard and (onH4 or onH1 or onM15)
+bool drawFib = onH4 or fibOnLower
+
+// =====================================================
+// DRAWING HELPERS
+// =====================================================
+var array<line> allLines = array.new<line>()
+var array<label> allTags = array.new<label>()
+var array<line> activeLines = array.new<line>()
+var array<label> activeTags = array.new<label>()
+var array<int> lineCounts = array.new<int>()
+var array<int> tagCounts = array.new<int>()
+
+f_level(int when, float price, string caption, color tint) =>
+    line item = line.new(when, price, when + 3600000, price, xloc=xloc.bar_time, extend=extend.right, color=tint)
+    label tag = label.new(when + 3600000, price, caption + " " + str.tostring(price, format.mintick), xloc=xloc.bar_time, style=label.style_label_left, color=color.new(tint, 85), textcolor=tint, size=size.tiny)
+
+    array.push(allLines, item)
+    array.push(activeLines, item)
+    array.push(allTags, tag)
+    array.push(activeTags, tag)
+
+f_num(float x) =>
+    na(x) ? "null" : str.tostring(x, "#.##########")
+
+// =====================================================
+// DISPLAY STATE
+// =====================================================
+var int lastProcessed = na
+var string lastStatus = "DANG TAI DU LIEU H1"
+var string lastOutcome = "N/A"
+
+var float lastEntry = na
+var float lastSL = na
+var float lastTP = na
+var int lastDirection = 0
+var int lastWaveState = 0
+var bool lastLocked = false
+var float lastH4EMA = na
+var float lastH4ATR = na
+
+bool buyAlert = false
+bool sellAlert = false
+bool tpAlert = false
+bool slAlert = false
+bool confirmAlert = false
+bool invalidAlert = false
+
+// =====================================================
+// RENDER CLOSED H1 EVENTS
+// =====================================================
+if supported and array.size(atc) > 0
+    for i = 0 to array.size(atc) - 1
+        int tc = array.get(atc, i)
+
+        bool completed = onH4 ? tc <= timenow and tc <= time_close : barstate.isconfirmed and tc <= time_close
+
+        if completed and not na(tc) and (na(lastProcessed) or tc > lastProcessed)
+            lastProcessed := tc
+
+            int event = array.get(aev, i)
+            int dir = array.get(apd, i)
+
+            float pe = array.get(ape, i)
+            float ps = array.get(aps, i)
+            float pt = array.get(apt, i)
+            float pa = array.get(apa, i)
+            float pb = array.get(apb, i)
+            float pc = array.get(apc, i)
+
+            int eventKey = array.get(apk, i)
+
+            lastStatus := array.get(ast, i)
+            lastOutcome := array.get(aoc, i)
+            lastEntry := pe
+            lastSL := ps
+            lastTP := pt
+            lastDirection := dir
+            lastWaveState := array.get(aws, i)
+            lastLocked := array.get(alk, i)
+            lastH4EMA := array.get(ahe, i)
+            lastH4ATR := array.get(ahat, i)
+
+            // New Entry.
+            if event == 1 or event == -1
+                array.clear(activeLines)
+                array.clear(activeTags)
+
+                int beforeLines = array.size(allLines)
+                int beforeTags = array.size(allTags)
+
+                string caption = event == 1 ? "BUY H1" : "SELL H1"
+                string stamp = str.format_time(tc, "yyyy-MM-dd HH:mm", syminfo.timezone)
+
+                array.push(allTags, label.new(tc, event == 1 ? array.get(alo, i) : array.get(ahi, i), caption, xloc=xloc.bar_time, style=event == 1 ? label.style_label_up : label.style_label_down, color=event == 1 ? color.lime : color.red, textcolor=color.black, size=size.small, tooltip="Confirmed H1 close: " + stamp))
+
+                f_level(tc, pe, "ENTRY H1", color.silver)
+                f_level(tc, ps, "SL", color.red)
+
+                if drawFib
+                    if showWave
+                        int anchorATime = array.get(aat, i)
+                        int anchorBTime = array.get(abt, i)
+                        int anchorCTime = array.get(act, i)
+
+                        if not na(anchorATime) and not na(anchorBTime) and not na(anchorCTime)
+                            array.push(allLines, line.new(anchorATime, pa, anchorBTime, pb, xloc=xloc.bar_time, color=color.gray, style=line.style_dotted))
+                            array.push(allLines, line.new(anchorBTime, pb, anchorCTime, pc, xloc=xloc.bar_time, color=color.gray, style=line.style_dotted))
+
+                            array.push(allTags, label.new(anchorATime, pa, "A H4", xloc=xloc.bar_time, color=color.new(color.gray, 75), textcolor=color.white, size=size.tiny))
+                            array.push(allTags, label.new(anchorBTime, pb, "W1 / B", xloc=xloc.bar_time, color=color.new(color.gray, 75), textcolor=color.white, size=size.tiny))
+                            array.push(allTags, label.new(anchorCTime, pc, "W2 / C", xloc=xloc.bar_time, color=color.new(color.orange, 65), textcolor=color.white, size=size.tiny))
+
+                    array<float> multiples = array.from(0.0, 0.5, 1.0, 1.618)
+
+                    for j = 0 to 3
+                        float r = array.get(multiples, j)
+                        float price = j == 3 ? pt : math.round_to_mintick(pc + (pb - pa) * r)
+
+                        f_level(tc, price, j == 3 ? "TP H4 1.618" : "FIB H4 " + str.tostring(r), j == 3 ? color.aqua : color.new(color.gray, 35))
+
+                array.push(lineCounts, array.size(allLines) - beforeLines)
+                array.push(tagCounts, array.size(allTags) - beforeTags)
+
+                int keep = history ? 5 : 1
+
+                while array.size(lineCounts) > keep
+                    int removeLines = array.shift(lineCounts)
+                    int removeTags = array.shift(tagCounts)
+
+                    if removeLines > 0
+                        for j = 1 to removeLines
+                            line.delete(array.shift(allLines))
+
+                    if removeTags > 0
+                        for j = 1 to removeTags
+                            label.delete(array.shift(allTags))
+
+            // TP or SL: finish displayed plan.
+            else if event == 2 or event == -2
+                for item in activeLines
+                    line.set_extend(item, extend.none)
+                    line.set_x2(item, tc)
+
+                for item in activeTags
+                    label.set_x(item, tc + 3600000)
+
+                array.clear(activeLines)
+                array.clear(activeTags)
+
+                if array.size(tagCounts) > 0
+                    array.push(allTags, label.new(tc, event == 2 ? pt : ps, event == 2 ? "TP" : "SL", xloc=xloc.bar_time, color=event == 2 ? color.aqua : color.red, textcolor=color.black, size=size.tiny))
+
+                    int last = array.size(tagCounts) - 1
+                    array.set(tagCounts, last, array.get(tagCounts, last) + 1)
+
+            // Alerts only on H1.
+            if onH1 and barstate.isconfirmed
+                buyAlert := event == 1
+                sellAlert := event == -1
+                tpAlert := event == 2
+                slAlert := event == -2
+                confirmAlert := event == 3
+                invalidAlert := event == 4
+
+                if event != 0 and jsonAlerts
+                    string eventName = event == 1 ? "EARLY_WAVE3_BUY" : event == -1 ? "EARLY_WAVE3_SELL" : event == 2 ? "TAKE_PROFIT_1618" : event == -2 ? "STOP_LOSS" : event == 3 ? "WAVE3_CONFIRMED" : "SETUP_INVALIDATED"
+
+                    bool planEvent = event != 4
+                    string uid = syminfo.tickerid + ":60:" + str.tostring(eventKey) + ":" + eventName
+
+                    string msg = "{\"signal_id\":\"" + uid + "\",\"symbol\":\"" + syminfo.tickerid + "\",\"timeframe\":\"60\",\"fib_timeframe\":\"240\",\"event\":\"" + eventName + "\",\"timestamp_ms\":" + str.tostring(tc)
+
+                    msg += ",\"entry\":" + f_num(planEvent ? pe : na) + ",\"sl\":" + f_num(planEvent ? ps : na) + ",\"tp\":" + f_num(planEvent ? pt : na) + ",\"cycle_locked\":" + (lastLocked ? "true" : "false") + "}"
+
+                    alert(msg, alert.freq_once_per_bar_close)
+
+// Keep active price tags near the right side.
+if supported and lastLocked
+    for item in activeTags
+        label.set_x(item, time_close + 3600000)
+
+// =====================================================
+// H4 WAITING ZONE
+// =====================================================
+var box zone = na
+
+if supported
+    if not na(zone)
+        box.delete(zone)
+        zone := na
+
+    if showZone and onH4 and lastWaveState == 2 and not lastLocked and not na(lastH4EMA)
+        zone := box.new(time, lastH4EMA + tolerance4 * lastH4ATR, time_close, lastH4EMA - tolerance4 * lastH4ATR, xloc=xloc.bar_time, border_color=color.new(color.orange, 70), bgcolor=color.new(color.orange, 93), text="H4 W2 - VUNG CHO", text_size=size.tiny)
+
+// =====================================================
+// DASHBOARD
+// =====================================================
+var table panel = table.new(position.top_right, 2, 6, bgcolor=color.new(color.black, 15))
+
+if barstate.islast
+    string view = not supported ? "CHON M15 / H1 / H4" : onH4 ? "H4: SONG + FIB" : onH1 ? "H1: ENTRY + ALERT" : "M15: XEM TIN HIEU H1"
+
+    array<string> titles = array.from("ALPHA MTF", "TRANG THAI H1", "ENTRY GAN NHAT", "SL", "TP H4 1.618", "CHU KY GAN NHAT")
+
+    array<string> values = array.from(view, lastStatus, na(lastEntry) ? "N/A" : (lastDirection == 1 ? "BUY " : "SELL ") + str.tostring(lastEntry, format.mintick), na(lastSL) ? "N/A" : str.tostring(lastSL, format.mintick), na(lastTP) ? "N/A" : str.tostring(lastTP, format.mintick), lastOutcome)
+
+    for row = 0 to 5
+        table.cell(panel, 0, row, array.get(titles, row), text_color=color.silver, text_size=size.small)
+        table.cell(panel, 1, row, array.get(values, row), text_color=row == 3 ? color.red : row == 4 ? color.aqua : color.white, text_size=size.small)
+
+// =====================================================
+// H1 ALERT CONDITIONS
+// =====================================================
+alertcondition(buyAlert, "EARLY_WAVE3_BUY", "BUY {{ticker}} at confirmed H1 close.")
+alertcondition(sellAlert, "EARLY_WAVE3_SELL", "SELL {{ticker}} at confirmed H1 close.")
+alertcondition(tpAlert, "TAKE_PROFIT_1618", "TP 1.618 touched {{ticker}}. Cycle completed.")
+alertcondition(slAlert, "STOP_LOSS", "SL touched {{ticker}}. Cycle completed.")
+alertcondition(confirmAlert, "WAVE3_CONFIRMED", "W1 endpoint broken {{ticker}} H1.")
+alertcondition(invalidAlert, "SETUP_INVALIDATED", "Pending wave setup invalidated {{ticker}} H1.")
