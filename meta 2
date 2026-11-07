@@ -1,0 +1,360 @@
+//@version=6
+indicator("ALPHA CRAZII MINIMAL V2", shorttitle="ALPHA MIN V2", overlay=true, max_lines_count=5)
+
+// Independent CRAZII-style system.
+// RSI is not KSI. ATR/R targets are not proprietary KTR.
+// MLP uses prior HIGH/LOW according to this V2 specification.
+
+// ==================== SIGNAL SETTINGS ====================
+string mode = input.string("Balanced", "Signal mode", options=["Aggressive", "Balanced", "Conservative"], group="1. Signals")
+
+bool useOP = input.bool(true, "OP Filter", group="1. Signals")
+
+string referenceInput = input.timeframe("", "OP / MLP timeframe: blank = Auto", tooltip="Auto: intraday=D, daily=W, weekly/higher=M. A reference below the chart timeframe is raised to the chart timeframe. Bars crossing a reference boundary are skipped when that reference is required.", group="1. Signals")
+
+float minBody = input.float(45.0, "Minimum candle body %", minval=1, maxval=100, step=1, group="1. Signals")
+
+float closeZone = input.float(75.0, "BUY close position %: SELL is mirrored", minval=50, maxval=100, step=1, tooltip="75 means BUY close is in the top 25% of the candle, SELL in the bottom 25%.", group="1. Signals")
+
+int cooldownBars = input.int(8, "Full bars to skip after a signal", minval=0, group="1. Signals")
+
+// ==================== CONFIRMATION ====================
+bool useRSI = input.bool(true, "RSI Filter", group="2. Confirmation")
+int rsiLength = input.int(14, "RSI length", minval=1, group="2. Confirmation")
+
+float rsiBuyThreshold = input.float(55.0, "BUY: RSI above", minval=0, maxval=100, group="2. Confirmation")
+float rsiSellThreshold = input.float(45.0, "SELL: RSI below", minval=0, maxval=100, group="2. Confirmation")
+
+bool useMLP = input.bool(true, "MLP Filter", group="2. Confirmation")
+
+// ==================== RISK LEVELS ====================
+int atrLength = input.int(14, "ATR length", minval=1, group="3. Risk levels")
+
+float atrMultiplier = input.float(1.5, "SL ATR multiplier", minval=0.1, step=0.1, group="3. Risk levels")
+
+float tp1R = input.float(1.5, "TP1 R", minval=0.1, step=0.1, group="3. Risk levels")
+float tp2R = input.float(2.0, "TP2 R", minval=0.1, step=0.1, group="3. Risk levels")
+float tp3R = input.float(3.0, "TP3 R", minval=0.1, step=0.1, group="3. Risk levels")
+
+// ==================== MINIMAL UI ====================
+bool showLevels = input.bool(true, "Show Levels", group="4. Minimal UI")
+bool showDashboard = input.bool(true, "Show Dashboard", group="4. Minimal UI")
+
+bool candleColoring = input.bool(false, "Candle Coloring", group="4. Minimal UI")
+
+bool showOP = input.bool(false, "Show OP", group="4. Minimal UI")
+bool showMLP = input.bool(false, "Show MLP", group="4. Minimal UI")
+
+bool enableJSON = input.bool(true, "Enable dynamic JSON alert()", group="5. Alerts")
+
+// ==================== INPUT VALIDATION ====================
+if barstate.isfirst
+    if not chart.is_standard
+        runtime.error("Use standard time-based candles. Synthetic charts are not supported for confirmed signals.")
+
+    if rsiBuyThreshold <= rsiSellThreshold
+        runtime.error("BUY RSI threshold must be greater than SELL RSI threshold.")
+
+    if tp2R <= tp1R or tp3R <= tp2R
+        runtime.error("Use increasing target multiples: TP1 < TP2 < TP3.")
+
+// ==================== SAFE REFERENCE PERIOD ====================
+string autoReference = timeframe.isintraday ? "D" : timeframe.isdaily ? "W" : "M"
+
+string requestedReference = referenceInput == "" ? autoReference : referenceInput
+
+float chartSeconds = timeframe.in_seconds()
+float requestedSeconds = timeframe.in_seconds(requestedReference)
+
+bool useChartReference = requestedSeconds <= chartSeconds
+
+string effectiveReference = useChartReference ? timeframe.period : requestedReference
+
+// Current reference OPEN and scheduled times are known values.
+// High/Low are taken only from the previous completed period.
+// No current reference High/Low/Close is requested.
+[remoteTime, remoteEnd, remoteOpen, remotePrevHigh, remotePrevLow] = request.security(syminfo.tickerid, effectiveReference, [time, time_close, open, high[1], low[1]], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+
+int referenceTime = useChartReference ? time : remoteTime
+int referenceEnd = useChartReference ? time_close : remoteEnd
+
+float referenceOpen = useChartReference ? open : remoteOpen
+float previousHigh = useChartReference ? high[1] : remotePrevHigh
+float previousLow = useChartReference ? low[1] : remotePrevLow
+
+// Reject mixed-reference candles, such as a week crossing
+// a monthly boundary, rather than using inconsistent HTF data.
+bool referenceAligned = not na(referenceTime) and not na(referenceEnd) and not na(time_close) and referenceTime <= time and time_close <= referenceEnd
+
+bool opAvailable = referenceAligned and not na(referenceOpen)
+
+bool mlpAvailable = referenceAligned and not na(previousHigh) and not na(previousLow)
+
+float op = opAvailable ? referenceOpen : na
+float mlp = mlpAvailable ? (previousHigh + previousLow) / 2.0 : na
+
+// ==================== CANDLE MOMENTUM ====================
+float candleRange = high - low
+float candleBody = math.abs(close - open)
+
+float bodyFraction = candleRange > 0 ? candleBody / candleRange : 0.0
+float closePosition = candleRange > 0 ? (close - low) / candleRange : 0.5
+
+bool buyMomentum = candleRange > 0 and close > open and bodyFraction >= minBody / 100.0 and closePosition >= closeZone / 100.0
+
+bool sellMomentum = candleRange > 0 and close < open and bodyFraction >= minBody / 100.0 and closePosition <= 1.0 - closeZone / 100.0
+
+// ==================== FILTERS ====================
+float rsiValue = ta.rsi(close, rsiLength)
+float atrValue = ta.atr(atrLength)
+
+bool rsiBuy = not na(rsiValue) and rsiValue > rsiBuyThreshold
+bool rsiSell = not na(rsiValue) and rsiValue < rsiSellThreshold
+
+bool mlpBuy = mlpAvailable and close > mlp
+bool mlpSell = mlpAvailable and close < mlp
+
+bool opBuy = not useOP or (opAvailable and close > op)
+bool opSell = not useOP or (opAvailable and close < op)
+
+// A disabled filter never counts as positive confirmation
+// in Balanced mode.
+// If both confirmation filters are OFF, use basic conditions.
+bool noConfirmations = not useRSI and not useMLP
+
+bool buyConfirmation = switch mode
+    "Aggressive" => true
+    "Balanced" => noConfirmations or (useRSI and rsiBuy) or (useMLP and mlpBuy)
+    => (not useRSI or rsiBuy) and (not useMLP or mlpBuy)
+
+bool sellConfirmation = switch mode
+    "Aggressive" => true
+    "Balanced" => noConfirmations or (useRSI and rsiSell) or (useMLP and mlpSell)
+    => (not useRSI or rsiSell) and (not useMLP or mlpSell)
+
+// ==================== CANDIDATE PRICES ====================
+// Entry is the exact chart Close.
+// Stop and targets are rounded to the symbol tick.
+float longSL = math.round_to_mintick(close - atrValue * atrMultiplier)
+float shortSL = math.round_to_mintick(close + atrValue * atrMultiplier)
+
+float longRisk = close - longSL
+float shortRisk = shortSL - close
+
+float longTP1 = math.round_to_mintick(close + longRisk * tp1R)
+float longTP2 = math.round_to_mintick(close + longRisk * tp2R)
+float longTP3 = math.round_to_mintick(close + longRisk * tp3R)
+
+float shortTP1 = math.round_to_mintick(close - shortRisk * tp1R)
+float shortTP2 = math.round_to_mintick(close - shortRisk * tp2R)
+float shortTP3 = math.round_to_mintick(close - shortRisk * tp3R)
+
+bool atrReady = not na(atrValue) and atrValue > 0 and syminfo.mintick > 0
+
+bool longPricesValid = atrReady and longRisk >= syminfo.mintick and longSL < close and longTP1 > close and longTP2 > longTP1 and longTP3 > longTP2
+
+bool shortPricesValid = atrReady and shortRisk >= syminfo.mintick and shortSL > close and shortTP1 < close and shortTP2 < shortTP1 and shortTP3 < shortTP2
+
+bool buySetup = buyMomentum and opBuy and buyConfirmation and longPricesValid
+bool sellSetup = sellMomentum and opSell and sellConfirmation and shortPricesValid
+
+// ==================== CONFIRMED SIGNAL ENGINE ====================
+var bool previousBuySetup = false
+var bool previousSellSetup = false
+
+var int lastSignalBar = na
+var int lastDirection = 0
+
+var float lastEntry = na
+var float lastSL = na
+var float lastTP1 = na
+var float lastTP2 = na
+var float lastTP3 = na
+
+bool buySignal = false
+bool sellSignal = false
+
+if barstate.isconfirmed
+    bool cooldownPassed = na(lastSignalBar) or bar_index - lastSignalBar > cooldownBars
+
+    buySignal := buySetup and not previousBuySetup and cooldownPassed
+    sellSignal := sellSetup and not previousSellSetup and cooldownPassed
+
+    // A transition blocked during cooldown is discarded.
+    // Another signal requires a new false -> true transition.
+    previousBuySetup := buySetup
+    previousSellSetup := sellSetup
+
+    if buySignal or sellSignal
+        lastSignalBar := bar_index
+        lastDirection := buySignal ? 1 : -1
+
+        lastEntry := close
+        lastSL := buySignal ? longSL : shortSL
+        lastTP1 := buySignal ? longTP1 : shortTP1
+        lastTP2 := buySignal ? longTP2 : shortTP2
+        lastTP3 := buySignal ? longTP3 : shortTP3
+
+// ==================== HISTORICAL SIGNAL MARKERS ====================
+plotshape(
+     buySignal,
+     title="BUY",
+     text="BUY",
+     style=shape.labelup,
+     location=location.belowbar,
+     color=color.green,
+     textcolor=color.white,
+     size=size.tiny)
+
+plotshape(
+     sellSignal,
+     title="SELL",
+     text="SELL",
+     style=shape.labeldown,
+     location=location.abovebar,
+     color=color.red,
+     textcolor=color.white,
+     size=size.tiny)
+
+// Native candle colors remain unchanged by default.
+barcolor(candleColoring and barstate.isconfirmed ? (buyMomentum ? color.yellow : sellMomentum ? color.red : na) : na)
+
+// Reference lines are hidden by default.
+plot(
+     showOP ? op : na,
+     "OP",
+     color=color.orange,
+     linewidth=1,
+     style=plot.style_stepline)
+
+plot(
+     showMLP ? mlp : na,
+     "MLP prior H/L midpoint",
+     color=color.silver,
+     linewidth=1,
+     style=plot.style_stepline)
+
+// ==================== LATEST FIVE LEVELS ONLY ====================
+var array<line> levelLines = array.new<line>()
+
+f_deleteLevels() =>
+    for item in levelLines
+        line.delete(item)
+    array.clear(levelLines)
+
+f_addLevel(float price, color tint) =>
+    line item = line.new(
+         x1=bar_index,
+         y1=price,
+         x2=bar_index + 5,
+         y2=price,
+         xloc=xloc.bar_index,
+         extend=extend.none,
+         color=tint,
+         width=1)
+
+    array.push(levelLines, item)
+
+if buySignal or sellSignal
+    f_deleteLevels()
+
+    if showLevels
+        f_addLevel(lastEntry, color.yellow)
+        f_addLevel(lastSL, color.red)
+        f_addLevel(lastTP1, color.green)
+        f_addLevel(lastTP2, color.rgb(144, 238, 144))
+        f_addLevel(lastTP3, color.aqua)
+
+if not showLevels
+    f_deleteLevels()
+else
+    for item in levelLines
+        // Only the right endpoint moves.
+        // Starting bar and level price remain frozen.
+        line.set_x2(item, bar_index + 5)
+
+// ==================== SEVEN-ROW DASHBOARD ====================
+f_price(float value) =>
+    na(value) ? "-" : str.tostring(value, format.mintick)
+
+var table dashboard = table.new(
+     position.top_right,
+     2,
+     7,
+     bgcolor=color.rgb(30, 32, 36),
+     border_width=0)
+
+if barstate.islast
+    if showDashboard
+        // BIAS is live OP context.
+        // SIGNAL is the latest confirmed signal.
+        int biasDirection = opAvailable ? (close > op ? 1 : close < op ? -1 : 0) : 0
+
+        string biasText = biasDirection == 1 ? "BUY" : biasDirection == -1 ? "SELL" : "NEUTRAL"
+
+        string signalText = lastDirection == 1 ? "BUY" : lastDirection == -1 ? "SELL" : "WAIT"
+
+        array<string> names = array.from(
+             "BIAS",
+             "SIGNAL",
+             "ENTRY",
+             "SL",
+             "TP1",
+             "TP2",
+             "TP3")
+
+        array<string> values = array.from(
+             biasText,
+             signalText,
+             f_price(lastEntry),
+             f_price(lastSL),
+             f_price(lastTP1),
+             f_price(lastTP2),
+             f_price(lastTP3))
+
+        for row = 0 to 6
+            int rowDirection = row == 0 ? biasDirection : row == 1 ? lastDirection : 0
+
+            color textTint = rowDirection == 1 ? color.lime : rowDirection == -1 ? color.red : color.white
+
+            table.cell(
+                 dashboard, 0, row,
+                 array.get(names, row),
+                 bgcolor=color.rgb(30, 32, 36),
+                 text_color=color.white,
+                 text_size=size.tiny)
+
+            table.cell(
+                 dashboard, 1, row,
+                 array.get(values, row),
+                 bgcolor=color.rgb(30, 32, 36),
+                 text_color=textTint,
+                 text_size=size.tiny)
+    else
+        table.clear(dashboard, 0, 0, 1, 6)
+
+// ==================== ALERT CONDITIONS ====================
+alertcondition(
+     buySignal,
+     title="BUY Alert",
+     message="ALPHA CRAZII MINIMAL V2 BUY {{ticker}} {{interval}} - confirmed candle close")
+
+alertcondition(
+     sellSignal,
+     title="SELL Alert",
+     message="ALPHA CRAZII MINIMAL V2 SELL {{ticker}} {{interval}} - confirmed candle close")
+
+// ==================== DYNAMIC JSON ALERT ====================
+if enableJSON and (buySignal or sellSignal)
+    string directionText = buySignal ? "BUY" : "SELL"
+
+    string message = "{\"ticker\":\"" + syminfo.tickerid + "\",\"timeframe\":\"" + timeframe.period + "\",\"signal\":\"" + directionText + "\""
+
+    message += ",\"entry\":" + f_price(lastEntry)
+    message += ",\"sl\":" + f_price(lastSL)
+    message += ",\"tp1\":" + f_price(lastTP1)
+    message += ",\"tp2\":" + f_price(lastTP2)
+    message += ",\"tp3\":" + f_price(lastTP3)
+    message += ",\"timestamp_ms\":" + str.tostring(time_close) + "}"
+
+    alert(message, alert.freq_once_per_bar_close)
