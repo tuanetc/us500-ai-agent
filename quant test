@@ -1,0 +1,316 @@
+from AlgorithmImports import *
+from datetime import datetime, timedelta
+from decimal import Decimal, ROUND_FLOOR
+
+
+class CandleChainBacktest(QCAlgorithm):
+
+    def initialize(self):
+        if self.live_mode:
+            raise RuntimeError("Backtest only.")
+
+        # CAU HINH MAC DINH
+        start = datetime.fromisoformat(
+            self.get_parameter("start") or "2021-11-25"
+        )
+        end = datetime.fromisoformat(
+            self.get_parameter("end") or "2026-11-24"
+        )
+
+        self.minutes = int(
+            self.get_parameter("minutes") or "1"
+        )
+        self.risk = Decimal(
+            self.get_parameter("risk_usd") or "3"
+        )
+        cash = float(
+            self.get_parameter("cash") or "10000"
+        )
+        slip_ticks = float(
+            self.get_parameter("slippage_ticks") or "0"
+        )
+
+        if not 1 <= self.minutes <= 1440 or 1440 % self.minutes:
+            raise ValueError(
+                "minutes must divide 1440: "
+                "1, 5, 15, 30, 60, 240, 1440..."
+            )
+
+        if (
+            not self.risk.is_finite()
+            or self.risk <= 0
+            or cash <= 0
+            or slip_ticks < 0
+        ):
+            raise ValueError("Invalid risk, cash or slippage.")
+
+        if end < start:
+            raise ValueError("end must be on or after start.")
+
+        self.set_start_date(start.year, start.month, start.day)
+        self.set_end_date(end.year, end.month, end.day)
+        self.set_account_currency("USD")
+        self.set_cash(cash)
+        self.set_time_zone(TimeZones.UTC)
+
+        self.set_brokerage_model(
+            BrokerageName.OANDA_BROKERAGE,
+            AccountType.MARGIN
+        )
+        self.set_maximum_orders(10000000)
+
+        self.security = self.add_cfd(
+            "SPX500USD",
+            Resolution.MINUTE,
+            market=Market.OANDA,
+            fill_forward=False
+        )
+        self.symbol = self.security.symbol
+
+        tick = float(
+            self.security.symbol_properties.minimum_price_variation
+        )
+        self.security.set_slippage_model(
+            ConstantSlippageModel(slip_ticks * tick)
+        )
+
+        self.stops = []
+        self.bars_seen = 0
+        self.entries = 0
+        self.skipped = 0
+
+        self.first_bar = None
+        self.last_bar = None
+        self.last_signal_time = None
+        self.last_raw_end = None
+
+        self.consolidator = None
+
+        if self.minutes > 1:
+            self.consolidator = QuoteBarConsolidator(
+                timedelta(minutes=self.minutes)
+            )
+            self.consolidator.data_consolidated += (
+                self.on_signal_bar
+            )
+
+    def on_data(self, data: Slice):
+        if not data.quote_bars.contains_key(self.symbol):
+            return
+
+        bar = data.quote_bars[self.symbol]
+
+        if (
+            bar.is_fill_forward
+            or bar.end_time == self.last_raw_end
+        ):
+            return
+
+        self.last_raw_end = bar.end_time
+
+        if self.consolidator is None:
+            self.on_signal_bar(None, bar)
+        else:
+            self.consolidator.update(bar)
+            self.consolidator.scan(bar.end_time)
+
+    def on_signal_bar(self, sender, bar: QuoteBar):
+        if (
+            bar.is_fill_forward
+            or bar.end_time == self.last_signal_time
+        ):
+            return
+
+        # Khong vao lenh theo nen cu bi phat ra tre sau gap.
+        if self.last_raw_end != bar.end_time:
+            return
+
+        self.last_signal_time = bar.end_time
+        self.bars_seen += 1
+
+        self.first_bar = self.first_bar or bar.time
+        self.last_bar = bar.end_time
+
+        self.stops = [
+            ticket for ticket in self.stops
+            if not self.closed(ticket)
+        ]
+
+        # OHLC cua QuoteBar la midpoint bid/ask.
+        if bar.close > bar.open:
+            direction = 1
+        elif bar.close < bar.open:
+            direction = -1
+        else:
+            direction = 0
+
+        holding = float(
+            self.portfolio[self.symbol].quantity
+        )
+
+        # Doji hoac nen nguoc chieu: dong het.
+        if direction == 0 or holding * direction < 0:
+            self.close_chain()
+
+        # Doji khong mo lenh moi.
+        if direction == 0:
+            return
+
+        props = self.security.symbol_properties
+
+        stop = self.decimal(
+            bar.low if direction == 1 else bar.high
+        )
+        bid = self.decimal(self.security.bid_price)
+        ask = self.decimal(self.security.ask_price)
+
+        if bid <= 0 or ask <= 0 or ask < bid:
+            self.skipped += 1
+            return
+
+        # Giu nguyen SL tai cuc tri nen.
+        if (
+            (direction == 1 and stop >= bid)
+            or (direction == -1 and stop <= ask)
+        ):
+            self.skipped += 1
+            return
+
+        tick = self.decimal(
+            props.minimum_price_variation
+        )
+
+        if tick > 0:
+            ticks = stop / tick
+            if abs(
+                ticks - ticks.to_integral_value()
+            ) > Decimal("0.000001"):
+                self.skipped += 1
+                return
+
+        entry = ask if direction == 1 else bid
+
+        multiplier = self.decimal(
+            props.contract_multiplier
+        )
+        conversion = self.decimal(
+            self.security.quote_currency.conversion_rate
+        )
+        step = self.decimal(props.lot_size)
+
+        unit_risk = (
+            abs(entry - stop)
+            * multiplier
+            * conversion
+        )
+
+        if unit_risk <= 0 or step <= 0:
+            self.skipped += 1
+            return
+
+        # Lam tron quantity xuong de khong vuot budget.
+        quantity = (
+            (self.risk / unit_risk / step)
+            .to_integral_value(rounding=ROUND_FLOOR)
+            * step
+        )
+
+        if quantity < step:
+            self.skipped += 1
+            return
+
+        ticket = self.market_order(
+            self.symbol,
+            direction * float(quantity),
+            tag="Candle entry"
+        )
+
+        # Chi dat SL cho phan da khop.
+        if not self.closed(ticket):
+            ticket.cancel("Cancel unfilled entry remainder")
+
+            if not self.closed(ticket):
+                raise RuntimeError(
+                    "Entry cancellation pending."
+                )
+
+        filled = float(ticket.quantity_filled)
+
+        if filled == 0:
+            self.skipped += 1
+            return
+
+        protective = self.stop_market_order(
+            self.symbol,
+            -filled,
+            float(stop),
+            tag=f"SL entry #{ticket.order_id}"
+        )
+
+        if protective.status in (
+            OrderStatus.INVALID,
+            OrderStatus.CANCELED
+        ):
+            raise RuntimeError(
+                "SL rejected. Inspect order errors."
+            )
+
+        self.stops.append(protective)
+        self.entries += 1
+
+    def close_chain(self):
+        # Huy SL cu truoc khi dong/dao chieu,
+        # tranh SL cu vo tinh mo vi the nguoc.
+        for ticket in self.stops:
+            if not self.closed(ticket):
+                ticket.cancel("Doji or reversal")
+
+        if self.transactions.get_open_orders(self.symbol):
+            raise RuntimeError(
+                "Cancellation pending; refusing to reverse."
+            )
+
+        self.stops.clear()
+
+        quantity = float(
+            self.portfolio[self.symbol].quantity
+        )
+
+        if quantity:
+            self.market_order(
+                self.symbol,
+                -quantity,
+                tag="Close chain"
+            )
+
+        if self.portfolio[self.symbol].quantity != 0:
+            raise RuntimeError(
+                "Exit not fully filled; refusing new chain."
+            )
+
+    @staticmethod
+    def closed(ticket):
+        return ticket.status in (
+            OrderStatus.FILLED,
+            OrderStatus.CANCELED,
+            OrderStatus.INVALID
+        )
+
+    @staticmethod
+    def decimal(value):
+        return Decimal(str(value))
+
+    def on_end_of_algorithm(self):
+        self.log(
+            f"Signal bars={self.bars_seen}; "
+            f"entries={self.entries}; "
+            f"skipped={self.skipped}"
+        )
+        self.log(
+            f"Observed coverage: "
+            f"{self.first_bar} -> {self.last_bar}"
+        )
+        self.log(
+            "Remaining positions are marked to market; "
+            "no forced final-candle exit."
+        )
